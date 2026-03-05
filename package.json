@@ -1,0 +1,28 @@
+{
+  "name": "claude-to-im",
+  "version": "0.1.0",
+  "description": "Host-agnostic bridge connecting Claude Code SDK to IM platforms (Telegram, Discord, Feishu)",
+  "type": "module",
+  "main": "src/lib/bridge/context.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:unit": "node --test --import tsx --test-timeout=15000 src/__tests__/unit/bridge-*.test.ts",
+    "test": "npm run typecheck && npm run test:unit",
+    "example": "npx tsx src/lib/bridge/examples/mock-host.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.62",
+    "@larksuiteoapi/node-sdk": "^1.59.0",
+    "discord.js": "^14.25.1",
+    "markdown-it": "^14.1.1"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
