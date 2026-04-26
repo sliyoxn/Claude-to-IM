@@ -186,6 +186,123 @@ export function nextMsgSeq(inboundMsgId: string): number {
   return next;
 }
 
+// ── Rich Media (image / file_data base64 upload + msg_type=7 send) ──
+//
+// QQ C2C rich media flow:
+//   1) POST /v2/users/{openid}/files with file_data base64 (or url) → returns file_info
+//   2) POST /v2/users/{openid}/messages with msg_type=7 + media.file_info
+//
+// file_info is openid-scoped and has a TTL (seconds, returned in the upload response,
+// typically ~10 min). Caller is responsible for caching/expiry.
+
+export type QQFileType = 1 | 2 | 3 | 4; // 1=image, 2=video, 3=voice, 4=file
+
+export interface QQUploadFileResult {
+  fileInfo: string;
+  fileUuid?: string;
+  ttl: number;
+}
+
+/**
+ * Upload a media file via base64 and return file_info for use in subsequent
+ * sendMediaMessage call. srv_send_msg is forced to false — we do upload-only
+ * and keep send as a separate explicit step.
+ */
+export async function uploadFileBase64(
+  accessToken: string,
+  openid: string,
+  fileType: QQFileType,
+  fileDataBase64: string,
+): Promise<QQUploadFileResult> {
+  const res = await fetch(
+    `${API_BASE}/v2/users/${encodeURIComponent(openid)}/files`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `QQBot ${accessToken}`,
+      },
+      body: JSON.stringify({
+        file_type: fileType,
+        file_data: fileDataBase64,
+        srv_send_msg: false,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    },
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`uploadFileBase64 failed (${res.status}): ${text}`);
+  }
+
+  const data = (await res.json()) as {
+    file_uuid?: string;
+    file_info?: string;
+    ttl?: number;
+  };
+
+  if (!data.file_info) {
+    throw new Error(`uploadFileBase64: response missing file_info: ${JSON.stringify(data)}`);
+  }
+
+  return {
+    fileInfo: data.file_info,
+    fileUuid: data.file_uuid,
+    ttl: data.ttl ?? 600,
+  };
+}
+
+export interface QQSendMediaParams {
+  openid: string;
+  msgId: string;
+  msgSeq: number;
+  fileInfo: string;
+  content?: string;
+}
+
+/** Send a rich-media (image) message. msg_type=7. */
+export async function sendMediaMessage(
+  accessToken: string,
+  params: QQSendMediaParams,
+): Promise<SendResult> {
+  const { openid, msgId, msgSeq, fileInfo, content } = params;
+
+  try {
+    const res = await fetch(
+      `${API_BASE}/v2/users/${encodeURIComponent(openid)}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `QQBot ${accessToken}`,
+        },
+        body: JSON.stringify({
+          content: content ?? ' ',
+          msg_type: 7,
+          msg_id: msgId,
+          msg_seq: msgSeq,
+          media: { file_info: fileInfo },
+        }),
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+
+    if (!res.ok) {
+      const text = await res.text();
+      return { ok: false, error: `QQ media API ${res.status}: ${text}` };
+    }
+
+    const data = (await res.json()) as { id?: string };
+    return { ok: true, messageId: data.id };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Network error',
+    };
+  }
+}
+
 /** Send a private (C2C) message to a QQ user. */
 export async function sendPrivateMessage(
   accessToken: string,

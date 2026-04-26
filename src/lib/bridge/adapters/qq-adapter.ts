@@ -24,6 +24,7 @@ import {
   getGatewayUrl,
   clearTokenCache,
   sendPrivateMessage,
+  sendMediaMessage,
   nextMsgSeq,
   buildIdentify,
   buildHeartbeat,
@@ -32,6 +33,12 @@ import {
   INTENTS,
   type GatewayPayload,
 } from './qq-api.js';
+import {
+  splitByStickers,
+  hasStickerMarker,
+  type StickerSegment,
+} from './feishu-stickers.js';
+import { QQStickerManager } from './qq-stickers.js';
 
 export class QQAdapter extends BaseChannelAdapter {
   readonly channelType: ChannelType = 'qq';
@@ -47,6 +54,7 @@ export class QQAdapter extends BaseChannelAdapter {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private shouldReconnect = false;
+  private stickerManager: QQStickerManager | null = null;
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -71,6 +79,10 @@ export class QQAdapter extends BaseChannelAdapter {
     this._running = true;
     this.shouldReconnect = true;
     this.reconnectAttempts = 0;
+
+    // Lazy-init sticker manager (loads manifest + cache from disk).
+    this.stickerManager = new QQStickerManager();
+    this.stickerManager.load();
 
     await this.connectGateway(gatewayUrl, token);
 
@@ -139,24 +151,122 @@ export class QQAdapter extends BaseChannelAdapter {
       const store = getBridgeContext().store;
       const appId = store.getSetting('bridge_qq_app_id') || '';
       const appSecret = store.getSetting('bridge_qq_app_secret') || '';
-
       const token = await getAccessToken(appId, appSecret);
-      const msgSeq = nextMsgSeq(message.replyToMessageId);
 
       let content = message.text;
       if (message.parseMode === 'HTML') {
         content = content.replace(/<[^>]+>/g, '');
       }
 
-      return await sendPrivateMessage(token, {
-        openid: message.address.chatId,
-        content,
-        msgId: message.replyToMessageId,
-        msgSeq,
-      });
+      // Fast path: no stickers → single text send.
+      if (!this.stickerManager || !hasStickerMarker(content)) {
+        return await sendPrivateMessage(token, {
+          openid: message.address.chatId,
+          content,
+          msgId: message.replyToMessageId,
+          msgSeq: nextMsgSeq(message.replyToMessageId),
+        });
+      }
+
+      // Sticker path: split into segments, send each with its own msg_seq.
+      // QQ requires unique msg_seq per reply to the same inbound msg_id.
+      // We return success if at least one segment lands; partial failures
+      // are logged but don't block the rest.
+      const segments = splitByStickers(content);
+      return await this.sendSegmented(
+        token,
+        message.address.chatId,
+        message.replyToMessageId,
+        segments,
+      );
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
+  }
+
+  /**
+   * Send a sequence of (text | sticker) segments as separate QQ messages.
+   * Each piece consumes the next msg_seq for the inbound msg_id. The first
+   * successful send's messageId is returned; the rest are sent best-effort.
+   */
+  private async sendSegmented(
+    token: string,
+    openid: string,
+    msgId: string,
+    segments: StickerSegment[],
+  ): Promise<SendResult> {
+    let firstResult: SendResult | null = null;
+    let anySuccess = false;
+    let lastError: string | undefined;
+
+    for (const seg of segments) {
+      const msgSeq = nextMsgSeq(msgId);
+
+      let result: SendResult;
+      if (seg.type === 'text') {
+        result = await sendPrivateMessage(token, {
+          openid,
+          content: seg.value,
+          msgId,
+          msgSeq,
+        });
+      } else {
+        // Sticker segment.
+        result = await this.sendOneSticker(token, openid, msgId, msgSeq, seg.id);
+      }
+
+      if (result.ok) {
+        anySuccess = true;
+        if (!firstResult) firstResult = result;
+      } else {
+        lastError = result.error;
+        console.warn(`[qq-adapter] Segment send failed (${seg.type}): ${result.error}`);
+      }
+    }
+
+    if (anySuccess && firstResult) return firstResult;
+    return { ok: false, error: lastError ?? 'all segments failed' };
+  }
+
+  /**
+   * Send one sticker. Falls back to a text description if the file_info
+   * lookup or media send fails — better than a silent drop.
+   */
+  private async sendOneSticker(
+    token: string,
+    openid: string,
+    msgId: string,
+    msgSeq: number,
+    stickerId: string,
+  ): Promise<SendResult> {
+    const mgr = this.stickerManager;
+    if (!mgr) {
+      return { ok: false, error: 'sticker manager not initialized' };
+    }
+
+    const fileInfo = await mgr.getFileInfo(token, openid, stickerId);
+    if (fileInfo) {
+      const mediaResult = await sendMediaMessage(token, {
+        openid,
+        msgId,
+        msgSeq,
+        fileInfo,
+      });
+      if (mediaResult.ok) return mediaResult;
+      console.warn(`[qq-adapter] Media send failed for ${stickerId}: ${mediaResult.error}`);
+    }
+
+    // Fallback: text describing the sticker so the user gets *something*.
+    const entry = mgr.getEntry(stickerId);
+    const fallback = entry
+      ? `[贴图:${entry.emotion}${entry.desc ? `/${entry.desc}` : ''}]`
+      : `[贴图:${stickerId}]`;
+    return await sendPrivateMessage(token, {
+      openid,
+      content: fallback,
+      msgId,
+      msgSeq,
+    });
   }
 
   // ── Config & Auth ───────────────────────────────────────────
