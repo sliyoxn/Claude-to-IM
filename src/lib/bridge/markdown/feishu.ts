@@ -56,6 +56,41 @@ export function buildCardContent(text: string): string {
 }
 
 /**
+ * Mixed card element — used by buildMixedCardContent for replies that
+ * interleave text and stickers (image_key references) within a single card.
+ */
+export type MixedCardElement =
+  | { type: 'text'; text: string }
+  | { type: 'image'; imageKey: string; alt?: string };
+
+/**
+ * Build a Feishu interactive card (schema 2.0) with multiple ordered elements
+ * — text markdown and image_key references. Used for sticker-bearing replies
+ * so a sticker + caption renders as ONE cohesive card instead of two separate
+ * messages.
+ */
+export function buildMixedCardContent(elements: MixedCardElement[]): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: {
+      wide_screen_mode: true,
+    },
+    body: {
+      elements: elements.map((el) => {
+        if (el.type === 'text') {
+          return { tag: 'markdown', content: el.text };
+        }
+        return {
+          tag: 'img',
+          img_key: el.imageKey,
+          alt: { tag: 'plain_text', content: el.alt ?? '' },
+        };
+      }),
+    },
+  });
+}
+
+/**
  * Build Feishu post message content (msg_type: 'post') with md tag.
  * Used for simple text without code blocks or tables.
  * Aligned with Openclaw's buildFeishuPostMessagePayload().

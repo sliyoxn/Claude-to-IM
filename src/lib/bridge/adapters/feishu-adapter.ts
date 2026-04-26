@@ -32,12 +32,19 @@ import {
   preprocessFeishuMarkdown,
   hasComplexMarkdown,
   buildCardContent,
+  buildMixedCardContent,
   buildPostContent,
   buildStreamingContent,
   buildFinalCardJson,
   buildPermissionButtonCard,
   formatElapsed,
+  type MixedCardElement,
 } from '../markdown/feishu.js';
+import {
+  StickerManager,
+  splitByStickers,
+  hasStickerMarker,
+} from './feishu-stickers.js';
 
 /** Max number of message_ids to keep for dedup. */
 const DEDUP_MAX = 1000;
@@ -120,6 +127,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private activeCards = new Map<string, FeishuCardState>();
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
   private cardCreatePromises = new Map<string, Promise<boolean>>();
+  /** Placeholder message id per chatId — set by onMessageStart, consumed by send(). */
+  private placeholderMessages = new Map<string, string>();
+  /** Sticker manager — lazy-loads manifest + image_key cache. */
+  private stickerManager = new StickerManager();
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -191,6 +202,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     this.wsClient.start({ eventDispatcher: dispatcher });
+
+    // Load sticker manifest + cache (warm-up; uploads still lazy on first use)
+    this.stickerManager.load();
 
     console.log('[feishu-adapter] Started (botOpenId:', this.botOpenId || 'unknown', ')');
   }
@@ -264,29 +278,63 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Called by bridge-manager via onMessageStart().
    */
   onMessageStart(chatId: string): void {
-    const messageId = this.lastIncomingMessageId.get(chatId);
-
-    // Create streaming card (fire-and-forget — fallback to traditional if fails)
-    if (messageId) {
-      this.createStreamingCard(chatId, messageId).catch(() => {});
-    }
-
-    // Typing indicator (same as before)
-    if (!messageId || !this.restClient) return;
-    this.restClient.im.messageReaction.create({
-      path: { message_id: messageId },
-      data: { reaction_type: { emoji_type: TYPING_EMOJI } },
-    }).then((res) => {
-      const reactionId = (res as any)?.data?.reaction_id;
-      if (reactionId) {
-        this.typingReactions.set(chatId, reactionId);
-      }
-    }).catch((err) => {
-      const code = (err as { code?: number })?.code;
-      if (code !== 99991400 && code !== 99991403) {
-        console.warn('[feishu-adapter] Typing indicator failed:', err instanceof Error ? err.message : err);
-      }
+    // PATCH: streaming card (cardkit.v2) and emoji typing reaction are both
+    // disabled. Instead, send an instant "在想..." placeholder card now and
+    // let send() patch it into the final answer when the LLM finishes.
+    this.sendPlaceholder(chatId).catch((err) => {
+      console.warn(
+        '[feishu-adapter] placeholder send failed:',
+        err instanceof Error ? err.message : err,
+      );
     });
+  }
+
+  private async sendPlaceholder(chatId: string): Promise<void> {
+    if (!this.restClient) return;
+    const cardContent = JSON.stringify({
+      config: { wide_screen_mode: true },
+      elements: [{ tag: 'markdown', content: '汐羽思考中…' }],
+    });
+    const res = await this.restClient.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: chatId,
+        msg_type: 'interactive',
+        content: cardContent,
+      },
+    });
+    const messageId = res?.data?.message_id;
+    if (messageId) {
+      this.placeholderMessages.set(chatId, messageId);
+    }
+  }
+
+  private async patchPlaceholder(messageId: string, text: string): Promise<boolean> {
+    if (!this.restClient) return false;
+    const cardContent = buildCardContent(text);
+    return this.patchPlaceholderRaw(messageId, cardContent);
+  }
+
+  /**
+   * Patch placeholder with a pre-built card JSON string. Used by the sticker
+   * path to inject a multi-element (text + image) card without re-rendering
+   * through buildCardContent.
+   */
+  private async patchPlaceholderRaw(messageId: string, cardContent: string): Promise<boolean> {
+    if (!this.restClient) return false;
+    try {
+      await this.restClient.im.message.patch({
+        path: { message_id: messageId },
+        data: { content: cardContent },
+      });
+      return true;
+    } catch (err) {
+      console.warn(
+        '[feishu-adapter] patch placeholder failed:',
+        err instanceof Error ? err.message : err,
+      );
+      return false;
+    }
   }
 
   /**
@@ -370,82 +418,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return promise;
   }
 
-  private async _doCreateStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
-    if (!this.restClient) return false;
-
-    try {
-      // Step 1: Create card via CardKit v2
-      const cardBody = {
-        schema: '2.0',
-        config: {
-          streaming_mode: true,
-          wide_screen_mode: true,
-          summary: { content: '思考中...' },
-        },
-        body: {
-          elements: [{
-            tag: 'markdown',
-            content: '💭 Thinking...',
-            text_align: 'left',
-            text_size: 'normal',
-            element_id: 'streaming_content',
-          }],
-        },
-      };
-
-      const createResp = await (this.restClient as any).cardkit.v2.card.create({
-        data: { type: 'card_json', data: JSON.stringify(cardBody) },
-      });
-      const cardId = createResp?.data?.card_id;
-      if (!cardId) {
-        console.warn('[feishu-adapter] Card create returned no card_id');
-        return false;
-      }
-
-      // Step 2: Send card as IM message
-      const cardContent = JSON.stringify({ type: 'card', data: { card_id: cardId } });
-      let msgResp;
-      if (replyToMessageId) {
-        msgResp = await this.restClient.im.message.reply({
-          path: { message_id: replyToMessageId },
-          data: { content: cardContent, msg_type: 'interactive' },
-        });
-      } else {
-        msgResp = await this.restClient.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'interactive',
-            content: cardContent,
-          },
-        });
-      }
-
-      const messageId = msgResp?.data?.message_id;
-      if (!messageId) {
-        console.warn('[feishu-adapter] Card message send returned no message_id');
-        return false;
-      }
-
-      // Store card state
-      this.activeCards.set(chatId, {
-        cardId,
-        messageId,
-        sequence: 0,
-        startTime: Date.now(),
-        toolCalls: [],
-        thinking: true,
-        pendingText: null,
-        lastUpdateAt: 0,
-        throttleTimer: null,
-      });
-
-      console.log(`[feishu-adapter] Streaming card created: cardId=${cardId}, msgId=${messageId}`);
-      return true;
-    } catch (err) {
-      console.warn('[feishu-adapter] Failed to create streaming card:', err instanceof Error ? err.message : err);
-      return false;
-    }
+  private async _doCreateStreamingCard(_chatId: string, _replyToMessageId?: string): Promise<boolean> {
+    // PATCH: @larksuiteoapi/node-sdk@1.62 (latest) only ships cardkit.v1, but
+    // the original implementation here targets cardkit.v2.* which doesn't
+    // exist on the SDK. Original try/catch block deleted (was dead code after
+    // return false; tsc strict-checked it anyway and broke the build).
+    // To restore: see git log of this file before 2026-04-26.
+    return false;
   }
 
   /**
@@ -647,13 +626,131 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
     }
 
-    // Rendering strategy (aligned with Openclaw):
-    // - Code blocks / tables → interactive card (schema 2.0 markdown)
-    // - Other text → post (md tag)
-    if (hasComplexMarkdown(text)) {
-      return this.sendAsCard(message.address.chatId, text);
+    const chatId = message.address.chatId;
+
+    // Detect sticker markers — if any, split into ordered text/sticker segments.
+    if (hasStickerMarker(text)) {
+      return this.sendWithStickers(chatId, text);
     }
-    return this.sendAsPost(message.address.chatId, text);
+
+    // No stickers: original behaviour (placeholder patch -> card / post).
+    return this.sendTextOnly(chatId, text, /* allowPlaceholder */ true);
+  }
+
+  /**
+   * Send a single text payload, optionally consuming the chat's placeholder card.
+   * Falls back to card / post strategy for fresh sends.
+   */
+  private async sendTextOnly(
+    chatId: string,
+    text: string,
+    allowPlaceholder: boolean,
+  ): Promise<SendResult> {
+    if (allowPlaceholder) {
+      const placeholderId = this.placeholderMessages.get(chatId);
+      if (placeholderId) {
+        this.placeholderMessages.delete(chatId);
+        const ok = await this.patchPlaceholder(placeholderId, text);
+        if (ok) return { ok: true, messageId: placeholderId };
+        // patch failed — fall through to fresh-message path
+      }
+    }
+
+    if (hasComplexMarkdown(text)) {
+      return this.sendAsCard(chatId, text);
+    }
+    return this.sendAsPost(chatId, text);
+  }
+
+  /**
+   * Send a sticker-bearing reply as ONE cohesive interactive card with text
+   * and image elements interleaved in original order.
+   *
+   * Pre-resolves all sticker image_keys in parallel; failed lookups fall back
+   * to a "[表情包：{emotion}]" text element so partial failures don't break
+   * the whole reply.
+   *
+   * Renders into a single message — patching the placeholder card if one
+   * exists, otherwise sending fresh.
+   */
+  private async sendWithStickers(chatId: string, text: string): Promise<SendResult> {
+    const segments = splitByStickers(text);
+    if (segments.length === 0) {
+      return this.sendTextOnly(chatId, text, true);
+    }
+
+    // Resolve sticker image_keys in parallel. Failed → fall back to text.
+    const elements: MixedCardElement[] = await Promise.all(
+      segments.map<Promise<MixedCardElement>>(async (seg) => {
+        if (seg.type === 'text') {
+          return { type: 'text', text: seg.value };
+        }
+        let imageKey: string | null = null;
+        try {
+          if (this.restClient) {
+            imageKey = await this.stickerManager.getImageKey(this.restClient, seg.id);
+          }
+        } catch (err) {
+          console.warn(
+            '[feishu-adapter] sticker getImageKey threw:',
+            err instanceof Error ? err.message : err,
+          );
+        }
+        if (imageKey) {
+          const entry = this.stickerManager.getEntry(seg.id);
+          return { type: 'image', imageKey, alt: entry?.emotion ?? '' };
+        }
+        const entry = this.stickerManager.getEntry(seg.id);
+        return { type: 'text', text: `[表情包：${entry?.emotion ?? seg.id}]` };
+      }),
+    );
+
+    // Merge consecutive text elements into one (cleaner card layout when the
+    // model outputs text\n\n[[sticker]]\n\ntext that ends up split).
+    const merged: MixedCardElement[] = [];
+    for (const el of elements) {
+      const last = merged[merged.length - 1];
+      if (el.type === 'text' && last && last.type === 'text') {
+        last.text = `${last.text}\n\n${el.text}`;
+      } else {
+        merged.push(el);
+      }
+    }
+
+    const cardContent = buildMixedCardContent(merged);
+
+    // Patch placeholder if available; otherwise send a fresh card.
+    const placeholderId = this.placeholderMessages.get(chatId);
+    if (placeholderId) {
+      this.placeholderMessages.delete(chatId);
+      const ok = await this.patchPlaceholderRaw(placeholderId, cardContent);
+      if (ok) return { ok: true, messageId: placeholderId };
+      // Patch failed — fall through to fresh-message path.
+    }
+
+    if (!this.restClient) {
+      return { ok: false, error: 'rest client not initialized' };
+    }
+    try {
+      const res = await this.restClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: cardContent,
+        },
+      });
+      const messageId = res?.data?.message_id;
+      if (!messageId) {
+        return { ok: false, error: 'fresh sticker card returned no message_id' };
+      }
+      return { ok: true, messageId };
+    } catch (err) {
+      return {
+        ok: false,
+        error: `fresh sticker card send failed: ${err instanceof Error ? err.message : err}`,
+      };
+    }
   }
 
   /**
