@@ -278,7 +278,9 @@ export async function sendMediaMessage(
           Authorization: `QQBot ${accessToken}`,
         },
         body: JSON.stringify({
-          content: content ?? ' ',
+          // Empty content avoids a trailing blank text line under the image
+          // in QQ's C2C rendering. Pass an explicit caption only when needed.
+          content: content ?? '',
           msg_type: 7,
           msg_id: msgId,
           msg_seq: msgSeq,

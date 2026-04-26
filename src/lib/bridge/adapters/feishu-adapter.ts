@@ -32,13 +32,11 @@ import {
   preprocessFeishuMarkdown,
   hasComplexMarkdown,
   buildCardContent,
-  buildMixedCardContent,
   buildPostContent,
   buildStreamingContent,
   buildFinalCardJson,
   buildPermissionButtonCard,
   formatElapsed,
-  type MixedCardElement,
 } from '../markdown/feishu.js';
 import {
   StickerManager,
@@ -312,16 +310,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private async patchPlaceholder(messageId: string, text: string): Promise<boolean> {
     if (!this.restClient) return false;
     const cardContent = buildCardContent(text);
-    return this.patchPlaceholderRaw(messageId, cardContent);
-  }
-
-  /**
-   * Patch placeholder with a pre-built card JSON string. Used by the sticker
-   * path to inject a multi-element (text + image) card without re-rendering
-   * through buildCardContent.
-   */
-  private async patchPlaceholderRaw(messageId: string, cardContent: string): Promise<boolean> {
-    if (!this.restClient) return false;
     try {
       await this.restClient.im.message.patch({
         path: { message_id: messageId },
@@ -663,15 +651,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
-   * Send a sticker-bearing reply as ONE cohesive interactive card with text
-   * and image elements interleaved in original order.
-   *
-   * Pre-resolves all sticker image_keys in parallel; failed lookups fall back
-   * to a "[表情包：{emotion}]" text element so partial failures don't break
-   * the whole reply.
-   *
-   * Renders into a single message — patching the placeholder card if one
-   * exists, otherwise sending fresh.
+   * Walk text segmented by [[sticker:NN_M]] markers and send each piece.
+   * Order preserved. The first text segment (if any) consumes the placeholder
+   * card; later text segments are fresh messages. Sticker upload/send failures
+   * fall back to a "[表情包：{emotion}]" text marker so the user never sees
+   * a silent drop.
    */
   private async sendWithStickers(chatId: string, text: string): Promise<SendResult> {
     const segments = splitByStickers(text);
@@ -679,78 +663,98 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return this.sendTextOnly(chatId, text, true);
     }
 
-    // Resolve sticker image_keys in parallel. Failed → fall back to text.
-    const elements: MixedCardElement[] = await Promise.all(
-      segments.map<Promise<MixedCardElement>>(async (seg) => {
-        if (seg.type === 'text') {
-          return { type: 'text', text: seg.value };
-        }
-        let imageKey: string | null = null;
-        try {
-          if (this.restClient) {
-            imageKey = await this.stickerManager.getImageKey(this.restClient, seg.id);
-          }
-        } catch (err) {
-          console.warn(
-            '[feishu-adapter] sticker getImageKey threw:',
-            err instanceof Error ? err.message : err,
-          );
-        }
-        if (imageKey) {
-          const entry = this.stickerManager.getEntry(seg.id);
-          return { type: 'image', imageKey, alt: entry?.emotion ?? '' };
-        }
-        const entry = this.stickerManager.getEntry(seg.id);
-        return { type: 'text', text: `[表情包：${entry?.emotion ?? seg.id}]` };
-      }),
-    );
+    let lastResult: SendResult = { ok: false, error: 'no segments sent' };
+    let placeholderConsumed = false;
 
-    // Merge consecutive text elements into one (cleaner card layout when the
-    // model outputs text\n\n[[sticker]]\n\ntext that ends up split).
-    const merged: MixedCardElement[] = [];
-    for (const el of elements) {
-      const last = merged[merged.length - 1];
-      if (el.type === 'text' && last && last.type === 'text') {
-        last.text = `${last.text}\n\n${el.text}`;
+    for (const seg of segments) {
+      if (seg.type === 'text') {
+        const result = await this.sendTextOnly(chatId, seg.value, !placeholderConsumed);
+        placeholderConsumed = true;
+        lastResult = result;
+        if (!result.ok) {
+          continue;
+        }
       } else {
-        merged.push(el);
+        const result = await this.sendStickerOrFallback(chatId, seg.id, !placeholderConsumed);
+        placeholderConsumed = true;
+        lastResult = result;
       }
     }
 
-    const cardContent = buildMixedCardContent(merged);
-
-    // Patch placeholder if available; otherwise send a fresh card.
-    const placeholderId = this.placeholderMessages.get(chatId);
-    if (placeholderId) {
-      this.placeholderMessages.delete(chatId);
-      const ok = await this.patchPlaceholderRaw(placeholderId, cardContent);
-      if (ok) return { ok: true, messageId: placeholderId };
-      // Patch failed — fall through to fresh-message path.
+    if (!placeholderConsumed) {
+      const placeholderId = this.placeholderMessages.get(chatId);
+      if (placeholderId) {
+        this.placeholderMessages.delete(chatId);
+        await this.patchPlaceholder(placeholderId, ' ');
+      }
     }
+
+    return lastResult;
+  }
+
+  /**
+   * Send a sticker by id. On any failure, fall back to a text marker so the
+   * user sees that the model intended to send a sticker.
+   */
+  private async sendStickerOrFallback(
+    chatId: string,
+    stickerId: string,
+    canUsePlaceholder: boolean,
+  ): Promise<SendResult> {
+    const entry = this.stickerManager.getEntry(stickerId);
+    const fallbackText = `[表情包：${entry?.emotion || stickerId}]`;
 
     if (!this.restClient) {
-      return { ok: false, error: 'rest client not initialized' };
+      return this.sendTextOnly(chatId, fallbackText, canUsePlaceholder);
     }
+
+    let imageKey: string | null = null;
+    try {
+      imageKey = await this.stickerManager.getImageKey(this.restClient, stickerId);
+    } catch (err) {
+      console.warn(
+        '[feishu-adapter] sticker getImageKey threw:',
+        err instanceof Error ? err.message : err,
+      );
+    }
+
+    if (!imageKey) {
+      return this.sendTextOnly(chatId, fallbackText, canUsePlaceholder);
+    }
+
+    // Image messages cannot patch a placeholder card in-place. If a placeholder
+    // exists and this sticker is the very first segment, drop the placeholder
+    // first (replace with a single space so the card collapses visually).
+    if (canUsePlaceholder) {
+      const placeholderId = this.placeholderMessages.get(chatId);
+      if (placeholderId) {
+        this.placeholderMessages.delete(chatId);
+        await this.patchPlaceholder(placeholderId, ' ');
+      }
+    }
+
     try {
       const res = await this.restClient.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
-          msg_type: 'interactive',
-          content: cardContent,
+          msg_type: 'image',
+          content: JSON.stringify({ image_key: imageKey }),
         },
       });
-      const messageId = res?.data?.message_id;
-      if (!messageId) {
-        return { ok: false, error: 'fresh sticker card returned no message_id' };
+      if (res?.data?.message_id) {
+        return { ok: true, messageId: res.data.message_id };
       }
-      return { ok: true, messageId };
+      console.warn('[feishu-adapter] sticker send returned no message_id:', res?.msg, res?.code);
     } catch (err) {
-      return {
-        ok: false,
-        error: `fresh sticker card send failed: ${err instanceof Error ? err.message : err}`,
-      };
+      console.warn(
+        '[feishu-adapter] sticker send error:',
+        err instanceof Error ? err.message : err,
+      );
     }
+
+    // Send fallback as a fresh message (placeholder already consumed above).
+    return this.sendTextOnly(chatId, fallbackText, false);
   }
 
   /**
